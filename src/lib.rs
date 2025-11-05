@@ -1,12 +1,8 @@
 #![cfg(windows)]
 #![deny(missing_docs)]
-#![no_std]
 //! This crate offers a DirectX 11 renderer for the [imgui-rs](https://docs.rs/imgui/*/imgui/) rust bindings.
 
-use alloc::vec;
-use alloc::vec::Vec;
-use core::ptr::null;
-use core::{mem, slice};
+use std::{mem, slice};
 
 use imgui::internal::RawWrapper;
 use imgui::{
@@ -65,16 +61,15 @@ impl Renderer {
         let vertex_buffer = Self::create_vertex_buffer(device, 0)?;
         let index_buffer = Self::create_index_buffer(device, 0)?;
 
-        let mut context = None;
-        device.GetImmediateContext(&mut context);
+        let context = device.GetImmediateContext()?;
 
         im_ctx.io_mut().backend_flags |= BackendFlags::RENDERER_HAS_VTX_OFFSET;
         let renderer_name = concat!("imgui_dx11_renderer@", env!("CARGO_PKG_VERSION"));
-        im_ctx.set_renderer_name(Some(renderer_name.parse().unwrap()));
+        im_ctx.set_renderer_name(Some(renderer_name.to_string()));
 
         Ok(Renderer {
             device: device.clone(),
-            context: context.unwrap(),
+            context,
             vertex_shader,
             pixel_shader,
             input_layout,
@@ -124,12 +119,12 @@ impl Renderer {
                 self.index_buffer =
                     Self::create_index_buffer(&self.device, draw_data.total_idx_count as usize)?;
             }
-            let _state_guard = StateBackup::backup(Some(self.context.clone()));
+            let _state_guard = StateBackup::backup(&self.context);
 
             self.write_buffers(draw_data)?;
             self.setup_render_state(draw_data);
             self.render_impl(draw_data)?;
-            _state_guard.restore();
+            _state_guard.restore(&self.context);
         }
         Ok(())
     }
@@ -141,7 +136,7 @@ impl Renderer {
         let mut index_offset = 0;
         let mut last_tex = TextureId::from(FONT_TEX_ID);
         let context = &self.context;
-        context.PSSetShaderResources(0, &[Some(self.font_resource_view.clone())]);
+        context.PSSetShaderResources(0, Some(&[Some(self.font_resource_view.clone())]));
         for draw_list in draw_data.draw_lists() {
             for cmd in draw_list.commands() {
                 match cmd {
@@ -158,7 +153,7 @@ impl Renderer {
                                     .ok_or(DXGI_ERROR_INVALID_CALL)?
                                     .clone()
                             };
-                            context.PSSetShaderResources(0, &[Some(texture)]);
+                            context.PSSetShaderResources(0, Some(&[Some(texture)]));
                             last_tex = texture_id;
                         }
 
@@ -168,7 +163,7 @@ impl Renderer {
                             right: ((clip_rect[2] - clip_off[0]) * clip_scale[0]) as i32,
                             bottom: ((clip_rect[3] - clip_off[1]) * clip_scale[1]) as i32,
                         };
-                        context.RSSetScissorRects(&[r]);
+                        context.RSSetScissorRects(Some(&[r]));
                         context.DrawIndexed(
                             count as u32,
                             index_offset as u32,
@@ -203,22 +198,28 @@ impl Renderer {
             DXGI_FORMAT_R32_UINT
         };
         let stride = mem::size_of::<DrawVert>() as u32;
-        let blend_factor = 0.0;
+        let blend_factor = [0.0; 4];
 
-        ctx.RSSetViewports(&[vp]);
+        ctx.RSSetViewports(Some(&[vp]));
         ctx.IASetInputLayout(&self.input_layout);
-        ctx.IASetVertexBuffers(0, 1, &Some(self.vertex_buffer.get_buf().clone()), &stride, &0);
+        ctx.IASetVertexBuffers(
+            0,
+            1,
+            Some(&Some(self.vertex_buffer.get_buf().clone())),
+            Some(&stride),
+            Some(&0),
+        );
         ctx.IASetIndexBuffer(self.index_buffer.get_buf(), draw_fmt, 0);
         ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        ctx.VSSetShader(&self.vertex_shader, &[]);
-        ctx.VSSetConstantBuffers(0, &[Some(self.constant_buffer.clone())]);
-        ctx.PSSetShader(&self.pixel_shader, &[]);
-        ctx.PSSetSamplers(0, &[Some(self.font_sampler.clone())]);
-        ctx.GSSetShader(None, &[]);
-        ctx.HSSetShader(None, &[]);
-        ctx.DSSetShader(None, &[]);
-        ctx.CSSetShader(None, &[]);
-        ctx.OMSetBlendState(&self.blend_state, &blend_factor, 0xFFFFFFFF);
+        ctx.VSSetShader(&self.vertex_shader, None);
+        ctx.VSSetConstantBuffers(0, Some(&[Some(self.constant_buffer.clone())]));
+        ctx.PSSetShader(&self.pixel_shader, None);
+        ctx.PSSetSamplers(0, Some(&[Some(self.font_sampler.clone())]));
+        ctx.GSSetShader(None, None);
+        ctx.HSSetShader(None, None);
+        ctx.DSSetShader(None, None);
+        ctx.CSSetShader(None, None);
+        ctx.OMSetBlendState(&self.blend_state, Some(&blend_factor), 0xFFFFFFFF);
         ctx.OMSetDepthStencilState(&self.depth_stencil_state, 0);
         ctx.RSSetState(&self.rasterizer_state);
     }
@@ -228,13 +229,16 @@ impl Renderer {
         let desc = D3D11_BUFFER_DESC {
             ByteWidth: (len * mem::size_of::<DrawVert>()) as u32,
             Usage: D3D11_USAGE_DYNAMIC,
-            BindFlags: D3D11_BIND_VERTEX_BUFFER.0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0,
+            BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as _,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as _,
             MiscFlags: 0,
             StructureByteStride: 0,
         };
 
-        device.CreateBuffer(&desc, null()).map(|buf| Buffer(buf, len))
+        let mut buf = None;
+        device.CreateBuffer(&desc, None, Some(&mut buf))?;
+
+        Ok(Buffer(buf.unwrap(), len))
     }
 
     unsafe fn create_index_buffer(device: &ID3D11Device, idx_count: usize) -> Result<Buffer> {
@@ -242,20 +246,35 @@ impl Renderer {
         let desc = D3D11_BUFFER_DESC {
             ByteWidth: (len * mem::size_of::<DrawIdx>()) as u32,
             Usage: D3D11_USAGE_DYNAMIC,
-            BindFlags: D3D11_BIND_INDEX_BUFFER.0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0,
+            BindFlags: D3D11_BIND_INDEX_BUFFER.0 as _,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as _,
             MiscFlags: 0,
             StructureByteStride: 0,
         };
 
-        device.CreateBuffer(&desc, null()).map(|buf| Buffer(buf, len))
+        let mut buf = None;
+        device.CreateBuffer(&desc, None, Some(&mut buf))?;
+
+        Ok(Buffer(buf.unwrap(), len))
     }
 
     unsafe fn write_buffers(&self, draw_data: &DrawData) -> Result<()> {
-        let vtx_resource: D3D11_MAPPED_SUBRESOURCE =
-            self.context.Map(self.vertex_buffer.get_buf(), 0, D3D11_MAP_WRITE_DISCARD, 0)?;
-        let idx_resource: D3D11_MAPPED_SUBRESOURCE =
-            self.context.Map(self.index_buffer.get_buf(), 0, D3D11_MAP_WRITE_DISCARD, 0)?;
+        let mut vtx_resource = D3D11_MAPPED_SUBRESOURCE::default();
+        self.context.Map(
+            self.vertex_buffer.get_buf(),
+            0,
+            D3D11_MAP_WRITE_DISCARD,
+            0,
+            Some(&mut vtx_resource),
+        )?;
+        let mut idx_resource = D3D11_MAPPED_SUBRESOURCE::default();
+        self.context.Map(
+            self.index_buffer.get_buf(),
+            0,
+            D3D11_MAP_WRITE_DISCARD,
+            0,
+            Some(&mut idx_resource),
+        )?;
 
         let mut vtx_dst = slice::from_raw_parts_mut(
             vtx_resource.pData.cast::<DrawVert>(),
@@ -278,8 +297,14 @@ impl Renderer {
         self.context.Unmap(self.vertex_buffer.get_buf(), 0);
         self.context.Unmap(self.index_buffer.get_buf(), 0);
 
-        let mapped_resource: D3D11_MAPPED_SUBRESOURCE =
-            self.context.Map(&self.constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0)?;
+        let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
+        self.context.Map(
+            &self.constant_buffer,
+            0,
+            D3D11_MAP_WRITE_DISCARD,
+            0,
+            Some(&mut mapped_resource),
+        )?;
         let l = draw_data.display_pos[0];
         let r = draw_data.display_pos[0] + draw_data.display_size[0];
         let t = draw_data.display_pos[1];
@@ -297,7 +322,7 @@ impl Renderer {
     }
 
     unsafe fn create_font_texture(
-        mut fonts: imgui::FontAtlasRefMut<'_>,
+        fonts: &mut imgui::FontAtlas,
         device: &ID3D11Device,
     ) -> Result<(ID3D11ShaderResourceView, ID3D11SamplerState)> {
         let fa_tex = fonts.build_rgba32_texture();
@@ -310,7 +335,7 @@ impl Renderer {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Usage: D3D11_USAGE_DEFAULT,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as _,
             ..Default::default()
         };
         let sub_resource = D3D11_SUBRESOURCE_DATA {
@@ -319,7 +344,8 @@ impl Renderer {
             SysMemSlicePitch: 0,
         };
 
-        let texture: ID3D11Texture2D = device.CreateTexture2D(&desc, &sub_resource)?;
+        let mut texture = None;
+        device.CreateTexture2D(&desc, Some(&sub_resource), Some(&mut texture))?;
         let mut srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D11_SRV_DIMENSION_TEXTURE2D,
@@ -327,7 +353,12 @@ impl Renderer {
         };
         srv_desc.Anonymous.Texture2D.MipLevels = desc.MipLevels;
         srv_desc.Anonymous.Texture2D.MostDetailedMip = 0;
-        let font_texture_view = device.CreateShaderResourceView(texture, &srv_desc)?;
+        let mut font_texture_view = None;
+        device.CreateShaderResourceView(
+            &texture.unwrap(),
+            Some(&srv_desc),
+            Some(&mut font_texture_view),
+        )?;
 
         fonts.tex_id = TextureId::from(FONT_TEX_ID);
 
@@ -342,8 +373,9 @@ impl Renderer {
             MaxLOD: 0.0,
             ..Default::default()
         };
-        let font_sampler = device.CreateSamplerState(&desc)?;
-        Ok((font_texture_view, font_sampler))
+        let mut font_sampler = None;
+        device.CreateSamplerState(&desc, Some(&mut font_sampler))?;
+        Ok((font_texture_view.unwrap(), font_sampler.unwrap()))
     }
 
     unsafe fn create_vertex_shader(
@@ -351,7 +383,8 @@ impl Renderer {
     ) -> Result<(ID3D11VertexShader, ID3D11InputLayout, ID3D11Buffer)> {
         const VERTEX_SHADER: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/vertex_shader.vs_4_0"));
-        let vs_shader = device.CreateVertexShader(VERTEX_SHADER, None)?;
+        let mut vs_shader = None;
+        device.CreateVertexShader(VERTEX_SHADER, None, Some(&mut vs_shader))?;
 
         let local_layout = [
             D3D11_INPUT_ELEMENT_DESC {
@@ -383,24 +416,28 @@ impl Renderer {
             },
         ];
 
-        let input_layout = device.CreateInputLayout(&local_layout, VERTEX_SHADER)?;
+        let mut input_layout = None;
+        device.CreateInputLayout(&local_layout, VERTEX_SHADER, Some(&mut input_layout))?;
 
         let desc = D3D11_BUFFER_DESC {
             ByteWidth: mem::size_of::<VertexConstantBuffer>() as _,
             Usage: D3D11_USAGE_DYNAMIC,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0,
+            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as _,
+            CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as _,
             MiscFlags: 0,
             StructureByteStride: 0,
         };
-        let vertex_constant_buffer = device.CreateBuffer(&desc, null())?;
-        Ok((vs_shader, input_layout, vertex_constant_buffer))
+        let mut vertex_constant_buffer = None;
+        device.CreateBuffer(&desc, None, Some(&mut vertex_constant_buffer))?;
+        Ok((vs_shader.unwrap(), input_layout.unwrap(), vertex_constant_buffer.unwrap()))
     }
 
     unsafe fn create_pixel_shader(device: &ID3D11Device) -> Result<ID3D11PixelShader> {
         const PIXEL_SHADER: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/pixel_shader.ps_4_0"));
-        device.CreatePixelShader(PIXEL_SHADER, None)
+        let mut pixel_shader = None;
+        device.CreatePixelShader(PIXEL_SHADER, None, Some(&mut pixel_shader))?;
+        Ok(pixel_shader.unwrap())
     }
 
     unsafe fn create_device_objects(
@@ -420,7 +457,8 @@ impl Renderer {
                 RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
             }; 8],
         };
-        let blend_state = device.CreateBlendState(&desc)?;
+        let mut blend_state = None;
+        device.CreateBlendState(&desc, Some(&mut blend_state))?;
 
         let desc = D3D11_RASTERIZER_DESC {
             FillMode: D3D11_FILL_SOLID,
@@ -429,7 +467,8 @@ impl Renderer {
             ScissorEnable: true.into(),
             ..Default::default()
         };
-        let rasterizer_state = device.CreateRasterizerState(&desc)?;
+        let mut rasterizer_state = None;
+        device.CreateRasterizerState(&desc, Some(&mut rasterizer_state))?;
 
         let stencil_op_desc = D3D11_DEPTH_STENCILOP_DESC {
             StencilFailOp: D3D11_STENCIL_OP_KEEP,
@@ -447,8 +486,10 @@ impl Renderer {
             FrontFace: stencil_op_desc,
             BackFace: stencil_op_desc,
         };
-        let depth_stencil_state = device.CreateDepthStencilState(&desc)?;
-        Ok((blend_state, rasterizer_state, depth_stencil_state))
+
+        let mut depth_stencil_state = None;
+        device.CreateDepthStencilState(&desc, Some(&mut depth_stencil_state))?;
+        Ok((blend_state.unwrap(), rasterizer_state.unwrap(), depth_stencil_state.unwrap()))
     }
 }
 
@@ -466,26 +507,30 @@ impl Buffer {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct StateBackup {
-    context: Option<ID3D11DeviceContext>,
-    scissor_rects: RECT,
-    viewports: D3D11_VIEWPORT,
+    scissor_rects_count: u32,
+    scissor_rects: [RECT; D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as _],
+    viewports_count: u32,
+    viewports: [D3D11_VIEWPORT; D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE as _],
     rasterizer_state: Option<ID3D11RasterizerState>,
     blend_state: Option<ID3D11BlendState>,
-    blend_factor: f32,
+    blend_factor: [f32; 4],
     sample_mask: u32,
     depth_stencil_state: Option<ID3D11DepthStencilState>,
     stencil_ref: u32,
     shader_resource: Vec<Option<ID3D11ShaderResourceView>>,
     sampler: Vec<Option<ID3D11SamplerState>>,
     ps_shader: Option<ID3D11PixelShader>,
-    ps_instances: Option<ID3D11ClassInstance>,
+    ps_instances_count: u32,
+    ps_instances: [Option<ID3D11ClassInstance>; 256],
     vs_shader: Option<ID3D11VertexShader>,
-    vs_instances: Option<ID3D11ClassInstance>,
+    vs_instances_count: u32,
+    vs_instances: [Option<ID3D11ClassInstance>; 256],
     constant_buffer: Vec<Option<ID3D11Buffer>>,
     gs_shader: Option<ID3D11GeometryShader>,
-    gs_instances: Option<ID3D11ClassInstance>,
+    gs_instances_count: u32,
+    gs_instances: [Option<ID3D11ClassInstance>; 256],
     index_buffer: Option<ID3D11Buffer>,
     index_buffer_offset: u32,
     index_buffer_format: DXGI_FORMAT,
@@ -497,75 +542,140 @@ struct StateBackup {
 }
 
 impl StateBackup {
-    unsafe fn backup(context: Option<ID3D11DeviceContext>) -> Self {
+    unsafe fn backup(ctx: &ID3D11DeviceContext) -> Self {
         let mut result = Self::default();
 
-        let ctx = context.as_ref().unwrap();
-        ctx.RSGetScissorRects(&mut 16, &mut result.scissor_rects);
-        ctx.RSGetViewports(&mut 16, &mut result.viewports);
-        ctx.RSGetState(&mut result.rasterizer_state);
-        ctx.OMGetBlendState(
-            &mut result.blend_state,
-            &mut result.blend_factor,
-            &mut result.sample_mask,
+        ctx.RSGetScissorRects(
+            &mut result.scissor_rects_count,
+            Some(result.scissor_rects.as_mut_ptr()),
         );
-        ctx.OMGetDepthStencilState(&mut result.depth_stencil_state, &mut result.stencil_ref);
-        ctx.PSGetShaderResources(0, &mut result.shader_resource);
-        ctx.PSGetSamplers(0, &mut result.sampler);
-        ctx.PSGetShader(&mut result.ps_shader, &mut result.ps_instances, &mut 256);
-        ctx.VSGetShader(&mut result.vs_shader, &mut result.vs_instances, &mut 256);
-        ctx.VSGetConstantBuffers(0, &mut result.constant_buffer);
-        ctx.GSGetShader(&mut result.gs_shader, &mut result.gs_instances, &mut 256);
-        ctx.IAGetPrimitiveTopology(&mut result.topology);
+        ctx.RSGetViewports(&mut result.viewports_count, Some(result.viewports.as_mut_ptr()));
+        result.rasterizer_state = ctx.RSGetState().ok();
+        ctx.OMGetBlendState(
+            Some(&mut result.blend_state),
+            Some(&mut result.blend_factor),
+            Some(&mut result.sample_mask),
+        );
+        ctx.OMGetDepthStencilState(
+            Some(&mut result.depth_stencil_state),
+            Some(&mut result.stencil_ref),
+        );
+        ctx.PSGetShaderResources(0, Some(&mut result.shader_resource));
+        ctx.PSGetSamplers(0, Some(&mut result.sampler));
+        ctx.PSGetShader(
+            &mut result.ps_shader,
+            Some(result.ps_instances.as_mut_ptr()),
+            Some(&mut result.ps_instances_count),
+        );
+        ctx.VSGetShader(
+            &mut result.vs_shader,
+            Some(result.vs_instances.as_mut_ptr()),
+            Some(&mut result.vs_instances_count),
+        );
+        ctx.VSGetConstantBuffers(0, Some(&mut result.constant_buffer));
+        ctx.GSGetShader(
+            &mut result.gs_shader,
+            Some(result.gs_instances.as_mut_ptr()),
+            Some(&mut result.gs_instances_count),
+        );
+        result.topology = ctx.IAGetPrimitiveTopology();
         ctx.IAGetIndexBuffer(
-            &mut result.index_buffer,
-            &mut result.index_buffer_format,
-            &mut result.index_buffer_offset,
+            Some(&mut result.index_buffer),
+            Some(&mut result.index_buffer_format),
+            Some(&mut result.index_buffer_offset),
         );
         ctx.IAGetVertexBuffers(
             0,
             1,
-            &mut result.vertex_buffer,
-            &mut result.vertex_buffer_stride,
-            &mut result.vertex_buffer_offset,
+            Some(&mut result.vertex_buffer),
+            Some(&mut result.vertex_buffer_stride),
+            Some(&mut result.vertex_buffer_offset),
         );
-        ctx.IAGetInputLayout(&mut result.input_layout);
-        result.context = context;
+        result.input_layout = ctx.IAGetInputLayout().ok();
         result
     }
-    pub fn restore(mut self) {
-        unsafe {
-            let ctx = self.context.as_ref().unwrap();
-            let inst =
-                if self.ps_instances.is_some() { vec![self.ps_instances.take()] } else { vec![] };
-            let vinst =
-                if self.vs_instances.is_some() { vec![self.vs_instances.take()] } else { vec![] };
 
-            ctx.RSSetScissorRects(&[self.scissor_rects]);
-            ctx.RSSetViewports(&[self.viewports]);
-            ctx.RSSetState(&self.rasterizer_state);
-            ctx.OMSetBlendState(&self.blend_state, &self.blend_factor, 0xFFFFFFFF);
-            ctx.OMSetDepthStencilState(&self.depth_stencil_state, self.stencil_ref);
-            ctx.PSSetShaderResources(0, &self.shader_resource);
-            ctx.PSSetSamplers(0, &self.sampler);
-            ctx.PSSetShader(self.ps_shader, &inst);
-            ctx.VSSetShader(self.vs_shader, &vinst);
-            ctx.VSSetConstantBuffers(0, &self.constant_buffer);
-            ctx.GSSetShader(&self.gs_shader, &[]);
+    pub fn restore(&self, ctx: &ID3D11DeviceContext) {
+        unsafe {
+            ctx.RSSetScissorRects(Some(&self.scissor_rects));
+            ctx.RSSetViewports(Some(&self.viewports));
+            ctx.RSSetState(self.rasterizer_state.as_ref());
+            ctx.OMSetBlendState(self.blend_state.as_ref(), Some(&self.blend_factor), 0xFFFFFFFF);
+            ctx.OMSetDepthStencilState(self.depth_stencil_state.as_ref(), self.stencil_ref);
+            ctx.PSSetShaderResources(0, Some(&self.shader_resource));
+            ctx.PSSetSamplers(0, Some(&self.sampler));
+            if let Some(ps_shader) = &self.ps_shader {
+                ctx.PSSetShader(
+                    ps_shader,
+                    Some(&self.ps_instances[..self.ps_instances_count as _]),
+                );
+            }
+            if let Some(vs_shader) = &self.vs_shader {
+                ctx.VSSetShader(
+                    vs_shader,
+                    Some(&self.vs_instances[..self.vs_instances_count as _]),
+                );
+            }
+            ctx.VSSetConstantBuffers(0, Some(&self.constant_buffer));
+            if let Some(gs_shader) = &self.gs_shader {
+                ctx.GSSetShader(
+                    gs_shader,
+                    Some(&self.gs_instances[..self.gs_instances_count as _]),
+                );
+            }
             ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx.IASetIndexBuffer(
-                &self.index_buffer,
+                self.index_buffer.as_ref(),
                 self.index_buffer_format,
                 self.index_buffer_offset,
             );
             ctx.IASetVertexBuffers(
                 0,
                 1,
-                &self.vertex_buffer,
-                &self.vertex_buffer_stride,
-                &self.vertex_buffer_offset,
+                Some(&self.vertex_buffer),
+                Some(&self.vertex_buffer_stride),
+                Some(&self.vertex_buffer_offset),
             );
-            ctx.IASetInputLayout(&self.input_layout);
+            if let Some(input_layout) = &self.input_layout {
+                ctx.IASetInputLayout(input_layout);
+            }
+        }
+    }
+}
+
+impl Default for StateBackup {
+    fn default() -> Self {
+        Self {
+            scissor_rects_count: Default::default(),
+            scissor_rects: Default::default(),
+            viewports_count: Default::default(),
+            viewports: Default::default(),
+            rasterizer_state: Default::default(),
+            blend_state: Default::default(),
+            blend_factor: Default::default(),
+            sample_mask: Default::default(),
+            depth_stencil_state: Default::default(),
+            stencil_ref: Default::default(),
+            shader_resource: Default::default(),
+            sampler: Default::default(),
+            ps_shader: Default::default(),
+            ps_instances_count: Default::default(),
+            ps_instances: [const { None }; _],
+            vs_shader: Default::default(),
+            vs_instances_count: Default::default(),
+            vs_instances: [const { None }; _],
+            constant_buffer: Default::default(),
+            gs_shader: Default::default(),
+            gs_instances_count: Default::default(),
+            gs_instances: [const { None }; _],
+            index_buffer: Default::default(),
+            index_buffer_offset: Default::default(),
+            index_buffer_format: Default::default(),
+            vertex_buffer: Default::default(),
+            vertex_buffer_offset: Default::default(),
+            vertex_buffer_stride: Default::default(),
+            topology: Default::default(),
+            input_layout: Default::default(),
         }
     }
 }
