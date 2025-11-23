@@ -51,7 +51,10 @@ fn main() -> Result<(), Box<dyn Error + 'static>> {
 }
 
 unsafe fn write_blob(shader_name: &str, blob: &ID3DBlob) -> Result<(), Box<dyn Error + 'static>> {
-    let out_dir = env::var("OUT_DIR")?;
-    let data = slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-    fs::write(format!("{}/{}", out_dir, shader_name), data).map_err(Into::into)
+    unsafe {
+        let out_dir = env::var("OUT_DIR")?;
+        let data =
+            slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        fs::write(format!("{}/{}", out_dir, shader_name), data).map_err(Into::into)
+    }
 }
